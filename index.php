@@ -257,6 +257,8 @@ Options -Indexes -MultiViews
     RewriteCond %{REQUEST_FILENAME} !-f
     RewriteRule ^export/([A-Za-z0-9]{1,20})/md$ {$self}?export=md&id=$1 [L,QSA,NC]
     RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^page/([0-9]{1,6})$ {$self}?page=$1 [L,QSA,NC]
+    RewriteCond %{REQUEST_FILENAME} !-f
     RewriteRule ^md/([A-Za-z0-9]{1,20})$ {$self}?export=md&id=$1&view=1 [L,QSA,NC]
 </IfModule>
 
@@ -2455,8 +2457,9 @@ function asset_url($path) {
     global $CFG;
     if (!is_string($path) || $path === '') return $path;
     if (preg_match('~^(?:[a-z][a-z0-9+.\-]*:)?//~i', $path)) return $path;
-    if (strpos($path, 'assets/') !== 0) return $path;
-    $rel = substr($path, strlen('assets/'));
+    $trimmed = ltrim($path, '/');
+    if (strpos($trimmed, 'assets/') !== 0) return $path;
+    $rel = substr($trimmed, strlen('assets/'));
     if ($rel === '' || strpos($rel, '..') !== false) return $path;
     $local = asset_token_url($CFG, $rel);
     if ($local === null) return $path; 
@@ -2538,6 +2541,8 @@ if (isset($_GET['img'])) {
 
     header('Content-Type: ' . $mime);
     header('X-Content-Type-Options: nosniff');
+    header('Access-Control-Allow-Origin: *');
+    header('Cross-Origin-Resource-Policy: cross-origin');
     if ($ext === 'svg') header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:");
     header('Accept-Ranges: bytes');
     header('Cache-Control: public, max-age=31536000, immutable');
@@ -3195,6 +3200,18 @@ if (isset($_GET['action']) && $_GET['action'] === 'search' && $_SERVER['REQUEST_
 }
 
 function render_article_page($exPost, $CFG, $asDownload = true, $downloadName = null, $canonicalQuery = null) {
+    if ($asDownload) {
+        @ini_set('memory_limit', '512M');
+        register_shutdown_function(function() {
+            $e = error_get_last();
+            if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true) && !headers_sent()) {
+                if (ob_get_level() > 0) { @ob_end_clean(); }
+                http_response_code(500);
+                header('Content-Type: text/plain; charset=UTF-8');
+                echo "Export failed: content too large for this server (" . $e['message'] . "). Try again or ask the site admin to raise memory_limit.";
+            }
+        });
+    }
     if ($asDownload && (!is_array($exPost) || !empty($exPost['protected']))) {
         pp_deny_export($CFG, is_array($exPost) ? (string)($exPost['slug'] ?? '') : '', 'html');
     }
@@ -3249,63 +3266,49 @@ function render_article_page($exPost, $CFG, $asDownload = true, $downloadName = 
         $content
     );
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+    // Images are embedded as base64, but only a small marker is placed into
+    // $content/$htmlOut here — the actual bytes are streamed straight to the
+    // response later (see the output loop below), never held fully in memory
+    // alongside the rest of the page. This is what makes "no size limit"
+    // possible on a host with a fixed, non-overridable memory_limit.
     $assetsReal = realpath($CFG['assets_dir']);
-    
-    
-    
-    
-    static $dataUriCache = [];
-    $content = preg_replace_callback('/<img\b[^>]*\bsrc="([^"]+)"[^>]*>/i', function($m) use ($CFG, $assetsReal, &$dataUriCache) {
+    $embedInfo = [];
+    $contentBeforeImages = $content;
+    $content = preg_replace_callback('/<img\b[^>]*\bsrc="([^"]+)"[^>]*>/i', function($m) use ($CFG, $assetsReal, &$embedInfo) {
         $full = $m[0];
         $url = $m[1];
         if (strpos($url, '/img/') === false) return $full;
         $token = substr($url, strrpos($url, '/img/') + 5);
         $token = preg_replace('~[?#].*$~', '', $token);
-        if (isset($dataUriCache[$token])) {
-            return $dataUriCache[$token] === null ? $full : preg_replace('/\bsrc="[^"]+"/i', 'src="' . $dataUriCache[$token] . '"', $full, 1);
+        if (!array_key_exists($token, $embedInfo)) {
+            $rel = asset_decode_token($CFG, $token);
+            $path = $rel !== null ? realpath($CFG['assets_dir'] . '/' . $rel) : false;
+            if ($path === false || $assetsReal === false || strpos($path, $assetsReal . DIRECTORY_SEPARATOR) !== 0 || !is_file($path)) {
+                $embedInfo[$token] = null;
+            } else {
+                $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+                $mime = asset_mime($ext);
+                $embedInfo[$token] = ($mime === null || strpos($mime, 'video/') === 0) ? null : ['path' => $path, 'mime' => $mime];
+            }
         }
-        $rel = asset_decode_token($CFG, $token);
-        if ($rel === null) { $dataUriCache[$token] = null; return $full; }
-        $path = realpath($CFG['assets_dir'] . '/' . $rel);
-        if ($path === false || $assetsReal === false || strpos($path, $assetsReal . DIRECTORY_SEPARATOR) !== 0 || !is_file($path)) {
-            $dataUriCache[$token] = null;
-            return $full;
-        }
-        
-        
-        
-        
-        
-        
-        if (filesize($path) > 2 * 1024 * 1024) { $dataUriCache[$token] = null; return $full; }
-        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
-        $mime = asset_mime($ext);
-        if ($mime === null || strpos($mime, 'video/') === 0) { $dataUriCache[$token] = null; return $full; } 
-        $bytes = @file_get_contents($path);
-        if ($bytes === false) { $dataUriCache[$token] = null; return $full; }
-        $dataUri = 'data:' . $mime . ';base64,' . base64_encode($bytes);
-        $dataUriCache[$token] = $dataUri;
-        return preg_replace('/\bsrc="[^"]+"/i', 'src="' . $dataUri . '"', $full, 1);
+        if ($embedInfo[$token] === null) return $full;
+        $marker = "\x02EMBED:{$token}\x02";
+        return preg_replace('/\bsrc="[^"]+"/i', 'src="' . $marker . '"', $full, 1);
     }, $content);
+    if ($content === null) { $content = $contentBeforeImages; $embedInfo = []; }
+    unset($contentBeforeImages);
 
+    $contentBeforeLinks = $content;
     $content = preg_replace_callback('/(src|href)="([^"]+)"/i', function($m) use ($base, $CFG) {
         $url = $m[2];
+        if (strpos($url, "\x02EMBED:") !== false) return $m[0];
         if (preg_match('~^(https?:|data:|mailto:|tel:|#)~i', $url)) return $m[0];
         if ($url !== '' && $url[0] === '/') return $m[1] . '="' . site_origin() . $url . '"'; 
         if ($url !== '' && $url[0] === '?') return $m[1] . '="' . $base . $CFG['self'] . $url . '"'; 
         return $m[1] . '="' . $base . ltrim($url, '/') . '"';
     }, $content);
+    if ($content === null) { $content = $contentBeforeLinks; }
+    unset($contentBeforeLinks);
 
     $extraCss = md_extra_css();
     $exTitle = htmlspecialchars($exPost['title']);
@@ -3352,12 +3355,26 @@ function render_article_page($exPost, $CFG, $asDownload = true, $downloadName = 
   });
 })();
 JS;
+    $copyJsHash = base64_encode(hash('sha256', $copyJs, true));
+    // HTTP response headers (CSP, X-Frame-Options, etc.) never travel with a
+    // saved/downloaded .html file — only the bytes do. So the same protection
+    // the live site gets via header() has to be baked in as <meta> tags here.
+    // script-src uses a hash of the exact inline script below (not a nonce —
+    // a nonce baked into a static file would be public and reusable, which
+    // defeats the point). X-Frame-Options and X-Content-Type-Options have no
+    // meta-tag equivalent; browsers only honor those as real HTTP headers.
+    $exportCsp = "default-src 'none'; img-src data: https: http:; media-src https: http:; "
+        . "style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com data:; "
+        . "script-src 'sha256-{$copyJsHash}'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
     $htmlOut = <<<HTML
 <!DOCTYPE html>
 <html lang="en" data-theme="{$themeIn}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{$exportCsp}">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta http-equiv="Permissions-Policy" content="geolocation=(), microphone=(), camera=()">
 <title>{$exTitle}</title>
 <meta name="description" content="{$exDesc}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -3456,22 +3473,38 @@ hr{border:0;border-top:1px solid var(--border);margin:2.4em 0;}
 </body>
 </html>
 HTML;
+    @ini_set('memory_limit', '512M');
     header('Content-Type: text/html; charset=UTF-8');
     if ($asDownload) {
         header('Content-Disposition: ' . content_disposition('attachment', $downloadName ?: $exPost['slug'], 'html'));
     }
-    if (ob_get_level() > 0) { @ob_end_clean(); } 
+    if (ob_get_level() > 0) { @ob_end_clean(); }
     header('Cache-Control: no-store');
-    $acceptsGzip = strpos((string)($_SERVER['HTTP_ACCEPT_ENCODING'] ?? ''), 'gzip') !== false;
-    $gzOut = $acceptsGzip && function_exists('gzencode') ? @gzencode($htmlOut, 6) : false;
-    if ($gzOut !== false) {
-        header('Content-Encoding: gzip');
-        header('Vary: Accept-Encoding');
-        header('Content-Length: ' . strlen($gzOut));
-        echo $gzOut;
-    } else {
-        header('Content-Length: ' . strlen($htmlOut));
-        echo $htmlOut;
+    header('X-Accel-Buffering: no');
+    // No Content-Length: total size depends on base64'd image bytes we haven't
+    // read yet. Streamed with chunked transfer encoding instead.
+    $embedParts = preg_split('/\x02EMBED:([^\x02]+)\x02/', $htmlOut, -1, PREG_SPLIT_DELIM_CAPTURE);
+    unset($htmlOut);
+    foreach ($embedParts as $i => $part) {
+        if ($i % 2 === 0) {
+            echo $part;
+            continue;
+        }
+        $info = $embedInfo[$part] ?? null;
+        if ($info === null) { continue; }
+        echo 'data:' . $info['mime'] . ';base64,';
+        $fh = @fopen($info['path'], 'rb');
+        if ($fh !== false) {
+            stream_filter_append($fh, 'convert.base64-encode');
+            while (!feof($fh)) {
+                $chunk = fread($fh, 3 * 65536);
+                if ($chunk === false) break;
+                echo $chunk;
+                if (function_exists('ob_flush')) { @ob_flush(); }
+                @flush();
+            }
+            fclose($fh);
+        }
     }
     exit;
 }
@@ -3766,8 +3799,8 @@ function paged_url($page, $activeFilters) {
     foreach (['category', 'difficulty', 'event', 'tag'] as $k) {
         if (!empty($activeFilters[$k])) $q[$k] = $activeFilters[$k];
     }
-    if ($page > 1) $q['page'] = $page;
-    return $q ? '?' . http_build_query($q, '', '&', PHP_QUERY_RFC3986) : home_url();
+    $path = $page > 1 ? pretty_dir() . '/page/' . (int)$page : home_url();
+    return $q ? $path . '?' . http_build_query($q, '', '&', PHP_QUERY_RFC3986) : $path;
 }
 
 $docNav = [];
@@ -4723,11 +4756,27 @@ body.pp-locked .wrap,body.pp-locked .site-head-bar{visibility:hidden;}
   var facetToggle = document.getElementById('facetPopToggle');
   var facetPop = document.getElementById('facetPop');
   if(facetToggle && facetPop){
+    var facetSearchRef = document.getElementById('blogSearch');
+    var positionFacetPop = function(){
+      facetPop.style.left = '';
+      facetPop.style.right = '';
+      var wrapped = facetSearchRef && (facetToggle.getBoundingClientRect().top > facetSearchRef.getBoundingClientRect().bottom - 4);
+      if(wrapped){ facetPop.style.left = '0'; facetPop.style.right = 'auto'; }
+      else {
+        var tRect = facetToggle.getBoundingClientRect();
+        var popWidth = facetPop.offsetWidth || 200;
+        if(tRect.right - popWidth < 8){ facetPop.style.left = '0'; facetPop.style.right = 'auto'; }
+      }
+    };
     facetToggle.addEventListener('click', function(e){
       e.stopPropagation();
       var open = facetPop.hasAttribute('hidden') ? false : true;
       if(open){ facetPop.setAttribute('hidden',''); facetToggle.setAttribute('aria-expanded','false'); }
-      else { facetPop.removeAttribute('hidden'); facetToggle.setAttribute('aria-expanded','true'); }
+      else {
+        facetPop.removeAttribute('hidden');
+        facetToggle.setAttribute('aria-expanded','true');
+        positionFacetPop();
+      }
     });
     document.addEventListener('click', function(e){
       if(!facetPop.contains(e.target) && e.target !== facetToggle) { facetPop.setAttribute('hidden',''); facetToggle.setAttribute('aria-expanded','false'); }
